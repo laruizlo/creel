@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""creel -- run Claude Code inside a per-project Docker sandbox.
+
+The image is LOCAL and PER-PROJECT (tagged from the directory name). Toolchains
+are described once in the TOOLCHAINS table below; selecting some renders a
+minimal Dockerfile containing only those, builds it, and launches Claude Code
+with the project bind-mounted and auth persisted in a named volume.
+
+Pure standard library, single file, no shell assumptions: it runs the same from
+bash, zsh, fish, or anything else. Add a toolchain by adding one Toolchain entry.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# ------------------------------------------------------------------ config
+BASE_IMAGE = os.environ.get("CREEL_BASE_IMAGE", "node:22-bookworm-slim")
+AUTH_VOLUME = os.environ.get("CREEL_AUTH_VOLUME", "creel-auth")
+DATA_VOLUME = os.environ.get("CREEL_DATA_VOLUME", "creel-data")
+WORKDIR = "/workspace"
+RUN_EXTRA = os.environ.get("CREEL_RUN_EXTRA", "")
+DRY_RUN = bool(os.environ.get("CREEL_DRY_RUN"))
+GPUS = os.environ.get("CREEL_GPUS", "all")             # --gpus value for CUDA
+FW_ALLOW = os.environ.get("CREEL_FIREWALL_ALLOW", "")  # extra allowed domains
+
+# Base tooling, always present. Includes the firewall machinery so that
+# --firewall is a pure run-time toggle needing no rebuild.
+BASE_APT = ["ca-certificates", "curl", "git", "less", "ripgrep", "sudo",
+            "iptables", "ipset", "dnsutils", "jq", "aggregate", "iproute2", "gosu"]
+
+LANG = "Languages / compilers"
+GPU = "GPU / accelerators"
+TYPESET = "Typesetting"
+MATH = "Math / proof assistants"
+
+# ------------------------------------------------------------ install fragments
+# Complete Dockerfile RUN instructions. Raw strings so shell tokens
+# ($HOME, ${ver}, $(...) ) survive verbatim into the generated Dockerfile.
+RUST_RUN = r"""RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal"""
+
+LEAN_RUN = r"""RUN curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan.sh \
+ && sh /tmp/elan.sh -y --default-toolchain stable \
+ && rm /tmp/elan.sh"""
+
+DOTNET_RUN = r"""RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet.sh \
+ && bash /tmp/dotnet.sh --channel LTS --install-dir "$HOME/.dotnet" \
+ && rm /tmp/dotnet.sh"""
+
+TAMARIN_RUN = r"""RUN NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+ && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" \
+ && brew install tamarin-prover/tap/tamarin-prover"""
+
+ISABELLE_RUN = r"""RUN set -eux; \
+    ver="Isabelle2025-2"; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) file="${ver}_linux.tar.gz" ;; \
+        arm64) file="${ver}_linux_arm.tar.gz" ;; \
+        *) echo "Isabelle: unsupported arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fSL "https://isabelle.in.tum.de/dist/${file}" -o /tmp/isabelle.tgz; \
+    tar -C /opt -xzf /tmp/isabelle.tgz; rm /tmp/isabelle.tgz; \
+    ln -sf "/opt/${ver}/bin/isabelle" /usr/local/bin/isabelle"""
+
+# CUDA toolkit only (no driver: the driver comes from the host via the NVIDIA
+# Container Toolkit). Version is pinned; bump CUDA_PKG when needed. amd64 only.
+CUDA_RUN = r"""RUN set -eux; \
+    if [ "$(dpkg --print-architecture)" != "amd64" ]; then \
+        echo "CUDA: this image supports amd64 only" >&2; exit 1; fi; \
+    curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+        -o /tmp/cuda-keyring.deb; \
+    dpkg -i /tmp/cuda-keyring.deb; rm /tmp/cuda-keyring.deb; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends cuda-toolkit-12-8; \
+    rm -rf /var/lib/apt/lists/*"""
+
+USER_BLOCK = r"""# --- host-matched 'dev' user so bind-mounted files stay yours -----
+RUN userdel -r node 2>/dev/null || true; groupdel node 2>/dev/null || true; \
+    groupadd -g ${HOST_GID} dev 2>/dev/null || true; \
+    useradd -u ${HOST_UID} -g ${HOST_GID} -m -s /bin/bash dev; \
+    echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev; \
+    mkdir -p /home/dev/.claude /home/dev/.local/share/claude /workspace; \
+    chown -R dev:dev /home/dev /workspace
+
+USER dev
+WORKDIR /workspace"""
+
+# --- firewall: baked into every image, activated only by --firewall -------
+# Default-deny egress with an allowlist (Anthropic API, npm, GitHub ranges,
+# plus $CREEL_FIREWALL_ALLOW). Adapted from Anthropic's reference
+# init-firewall.sh; ipset adds are made idempotent to avoid duplicate-IP aborts.
+FIREWALL_SH = r"""#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+echo "[creel] configuring egress firewall..."
+
+DOCKER_DNS_RULES=$(iptables-save -t nat | grep '127\.0\.0\.11' || true)
+iptables -F; iptables -X
+iptables -t nat -F; iptables -t nat -X
+iptables -t mangle -F; iptables -t mangle -X
+ipset destroy allowed-domains 2>/dev/null || true
+
+if [ -n "$DOCKER_DNS_RULES" ]; then
+  iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
+  iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
+  echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
+fi
+
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A INPUT  -p udp --sport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT  -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
+iptables -A INPUT  -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+ipset create allowed-domains hash:net
+
+echo "[creel] adding GitHub IP ranges..."
+gh=$(curl -s https://api.github.com/meta || true)
+if echo "$gh" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
+  for cidr in $(echo "$gh" | jq -r '(.web + .api + .git)[]' | aggregate -q 2>/dev/null \
+                || echo "$gh" | jq -r '(.web + .api + .git)[]'); do
+    [[ "$cidr" =~ ^[0-9.]+/[0-9]+$ ]] && ipset add allowed-domains "$cidr" 2>/dev/null || true
+  done
+fi
+
+for domain in registry.npmjs.org api.anthropic.com sentry.io statsig.anthropic.com statsig.com ${CREEL_FIREWALL_ALLOW:-}; do
+  [ -z "$domain" ] && continue
+  echo "[creel] resolving $domain..."
+  for ip in $(dig +short A "$domain" | grep -E '^[0-9.]+$' || true); do
+    ipset add allowed-domains "$ip" 2>/dev/null || true
+  done
+done
+
+HOST_IP=$(ip route | awk '/default/ {print $3; exit}')
+if [ -n "${HOST_IP:-}" ]; then
+  HOST_NET=$(echo "$HOST_IP" | sed 's/\.[0-9]*$/.0\/24/')
+  iptables -A INPUT  -s "$HOST_NET" -j ACCEPT
+  iptables -A OUTPUT -d "$HOST_NET" -j ACCEPT
+fi
+
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+iptables -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+
+if curl --connect-timeout 5 -s https://example.com >/dev/null 2>&1; then
+  echo "[creel] FIREWALL ERROR: example.com reachable; aborting." >&2
+  exit 1
+fi
+echo "[creel] firewall active (default-deny egress, allowlist applied)."
+"""
+
+FW_ENTRY_SH = r"""#!/bin/bash
+set -euo pipefail
+/usr/local/bin/creel-firewall.sh
+exec gosu dev "$@"
+"""
+
+
+@dataclass(frozen=True)
+class Toolchain:
+    name: str                       # --flag, attribute, selection key
+    category: str                   # help grouping
+    summary: str                    # one-line help
+    apt: tuple = ()                 # apt packages (batched into one root layer)
+    npm: tuple = ()                 # npm -g packages (added to the claude layer)
+    root_run: str = ""              # extra root RUN block (before user switch)
+    user_run: str = ""              # RUN block executed as the dev user
+    path: tuple = ()                # PATH entries to prepend
+    env: tuple = ()                 # (KEY, VALUE) ENV pairs
+    gpu: bool = False               # inject --gpus into `docker run`
+    test: str = ""                  # smoke-test shell command (exit 0 == ok)
+    size: str = ""                  # help annotation, e.g. "~1.2 GB"
+    note: str = ""                  # caveat surfaced in help / at build time
+
+
+# ------------------------------------------------------------- the table
+# Canonical order = build order (stable, so Docker layer cache survives adding a
+# toolchain: only layers at/after the new block are invalidated).
+TOOLCHAINS = [
+    Toolchain("rust", LANG, "rustup + cargo (stable, minimal)",
+              user_run=RUST_RUN, path=("/home/dev/.cargo/bin",),
+              test="rustc --version && cargo --version"),
+    Toolchain("gcc", LANG, "GNU C (gcc, make, gdb)",
+              apt=("gcc", "make", "gdb"),
+              test="printf 'int main(){return 0;}' > /tmp/t.c && gcc /tmp/t.c -o /tmp/t && /tmp/t && echo OK"),
+    Toolchain("cpp", LANG, "C++ (g++, cmake, make, gdb)",
+              apt=("g++", "cmake", "make", "gdb"),
+              test="printf 'int main(){return 0;}' > /tmp/t.cpp && g++ /tmp/t.cpp -o /tmp/tpp && /tmp/tpp && echo OK"),
+    Toolchain("c", LANG, "fuller C (gcc, clang, make, cmake, gdb, valgrind)",
+              apt=("gcc", "clang", "make", "cmake", "gdb", "valgrind"),
+              test="printf 'int main(){return 0;}' > /tmp/t.c && clang /tmp/t.c -o /tmp/tc && /tmp/tc && echo OK"),
+    Toolchain("python", LANG, "python3, pip, venv, pipx",
+              apt=("python3", "python3-pip", "python3-venv", "pipx"),
+              test="python3 --version && python3 -c 'print(1+1)'"),
+    Toolchain("ts", LANG, "TypeScript (typescript, ts-node, tsx) on the Node base",
+              npm=("typescript", "ts-node", "tsx"),
+              test="tsc --version && echo 'console.log(1+1)' > /tmp/t.ts && tsx /tmp/t.ts"),
+    Toolchain("go", LANG, "Go toolchain (distro golang-go)",
+              apt=("golang-go",), note="distro Go (1.19 on bookworm)",
+              test="go version"),
+    Toolchain("java", LANG, "JDK + Maven (default-jdk, maven)",
+              apt=("default-jdk", "maven"),
+              test="javac -version && printf 'class T{public static void main(String[] a){}}' > /tmp/T.java && cd /tmp && javac T.java && echo OK"),
+    Toolchain("csharp", LANG, ".NET SDK (LTS, dotnet-install into ~/.dotnet)",
+              apt=("libicu72",), user_run=DOTNET_RUN,
+              path=("/home/dev/.dotnet",), env=(("DOTNET_ROOT", "/home/dev/.dotnet"),),
+              test="dotnet --version"),
+    Toolchain("cuda", GPU, "CUDA toolkit 12.8 (nvcc + libraries), needs --gpus at run time",
+              root_run=CUDA_RUN, path=("/usr/local/cuda/bin",),
+              env=(("LD_LIBRARY_PATH", "/usr/local/cuda/lib64"),), gpu=True,
+              test="nvcc --version", size="~3-4 GB",
+              note="amd64 only; host needs NVIDIA driver + Container Toolkit"),
+    Toolchain("latex", TYPESET, "TeX Live (recommended+extra+science, latexmk, biber)",
+              apt=("texlive-latex-base", "texlive-latex-recommended", "texlive-latex-extra",
+                   "texlive-fonts-recommended", "texlive-science", "latexmk", "biber"),
+              size="large",
+              test="echo '\\documentclass{article}\\begin{document}hi\\end{document}' > /tmp/t.tex && cd /tmp && pdflatex -interaction=nonstopmode t.tex >/dev/null 2>&1 && test -f t.pdf && echo OK"),
+    Toolchain("sage", MATH, "SageMath (distro package)",
+              apt=("sagemath",), size="large", note="distro Sage ~9.5; use conda for current",
+              test="sage --version"),
+    Toolchain("lean", MATH, "Lean 4 via elan (stable)",
+              user_run=LEAN_RUN, path=("/home/dev/.elan/bin",),
+              test="lean --version && lake --version"),
+    Toolchain("isabelle", MATH, "Isabelle2025-2 bundle (arch-aware download)",
+              root_run=ISABELLE_RUN, size="~1.2 GB",
+              test="isabelle version"),
+    Toolchain("tamarin", MATH, "Tamarin prover via Linuxbrew (+ maude, graphviz)",
+              apt=("build-essential", "procps", "file", "graphviz"), user_run=TAMARIN_RUN,
+              path=("/home/linuxbrew/.linuxbrew/bin",), size="heavy/slow",
+              test="tamarin-prover --version"),
+]
+BY_NAME = {tc.name: tc for tc in TOOLCHAINS}
+ORDER = {tc.name: i for i, tc in enumerate(TOOLCHAINS)}
+
+
+# --------------------------------------------------------- Dockerfile render
+def _dedup(seq):
+    out = []
+    for x in seq:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def render_dockerfile(selected, base_image):
+    """Render a minimal Dockerfile for the selected toolchains (canonical order)."""
+    selected = sorted(selected, key=lambda tc: ORDER[tc.name])
+
+    apt = _dedup(BASE_APT + [p for tc in selected for p in tc.apt])
+    npm = _dedup([p for tc in selected for p in tc.npm])
+    root_runs = [tc.root_run for tc in selected if tc.root_run]
+    user_runs = [tc.user_run for tc in selected if tc.user_run]
+    env_pairs = [kv for tc in selected for kv in tc.env]
+    paths = _dedup([p for tc in selected for p in tc.path])
+
+    L = []
+    L.append("# syntax=docker/dockerfile:1")
+    L.append("# Generated by creel. Hand-edits are preserved (checksum-guarded);")
+    L.append("# use `creel --regen` to overwrite with the template.")
+    L.append("ARG BASE_IMAGE=" + base_image)
+    L.append("FROM ${BASE_IMAGE}")
+    L.append("")
+    L.append("ARG HOST_UID=1000")
+    L.append("ARG HOST_GID=1000")
+    L.append("ENV DEBIAN_FRONTEND=noninteractive")
+    L.append("")
+    L.append("# --- apt: base + selected system packages -------------------------")
+    L.append("RUN apt-get update && apt-get install -y --no-install-recommends \\")
+    L.append("        " + " ".join(apt) + " \\")
+    L.append(" && rm -rf /var/lib/apt/lists/*")
+    L.append("")
+    L.append("# --- Claude Code CLI (+ selected npm globals) ---------------------")
+    L.append("RUN npm install -g @anthropic-ai/claude-code" + ((" " + " ".join(npm)) if npm else ""))
+    L.append("")
+    L.append("# --- egress firewall machinery (activated at run time by --firewall)")
+    L.append("# Scripts are base64-embedded so the build works on both the legacy")
+    L.append("# builder and BuildKit (no heredoc dependency).")
+    fw_b64 = base64.b64encode(FIREWALL_SH.encode()).decode()
+    entry_b64 = base64.b64encode(FW_ENTRY_SH.encode()).decode()
+    L.append("RUN echo '" + fw_b64 + "' | base64 -d > /usr/local/bin/creel-firewall.sh \\")
+    L.append(" && echo '" + entry_b64 + "' | base64 -d > /usr/local/bin/creel-fw-entry \\")
+    L.append(" && chmod +x /usr/local/bin/creel-firewall.sh /usr/local/bin/creel-fw-entry")
+    L.append("")
+    for r in root_runs:
+        L.append(r)
+        L.append("")
+    L.append(USER_BLOCK)
+    L.append("")
+    for r in user_runs:
+        L.append(r)
+        L.append("")
+    for k, v in env_pairs:
+        L.append('ENV %s="%s"' % (k, v))
+    if paths:
+        L.append('ENV PATH="' + ":".join(paths) + ':${PATH}"')
+    L.append('ENV CLAUDE_CONFIG_DIR="/home/dev/.claude"')
+    return "\n".join(L) + "\n"
+
+
+# ------------------------------------------------------- checksum guard
+def _sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def guard_write(box, content, regen):
+    """Write Dockerfile unless the on-disk copy was hand-edited since we wrote it."""
+    df = box / "Dockerfile"
+    sums = box / ".dockerfile.sha256"
+    want = _sha(content)
+
+    def install():
+        df.write_text(content)
+        sums.write_text(want + "\n")
+
+    if not df.exists() or regen:
+        install()
+        return
+    have = _sha(df.read_text())
+    rec = sums.read_text().strip() if sums.exists() else ""
+    if have == rec:
+        if have != want:
+            install()
+            print(">> refreshed .creel/Dockerfile from template")
+    else:
+        print("creel: .creel/Dockerfile was hand-edited; keeping it "
+              "(use --regen to overwrite).", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- CLI
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="creel",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Run Claude Code in a per-project Docker sandbox.",
+        epilog="Flags define the FULL toolchain set and are saved to "
+               ".creel/selection.json.\nPassing any toolchain flag replaces "
+               "the saved set; running with none recalls it.\nForward args to "
+               "claude after `--`, e.g. `creel --rust -- --model opus`.",
+    )
+    groups = {}
+    for cat in (LANG, GPU, TYPESET, MATH):
+        groups[cat] = p.add_argument_group(cat)
+    for tc in TOOLCHAINS:
+        h = tc.summary
+        tags = [t for t in (tc.size, tc.note) if t]
+        if tags:
+            h += "  [" + "; ".join(tags) + "]"
+        groups[tc.category].add_argument("--" + tc.name, action="store_true", help=h)
+
+    opt = p.add_argument_group("Options")
+    opt.add_argument("--shell", action="store_true", help="open bash instead of claude")
+    opt.add_argument("--yolo", action="store_true",
+                     help="launch claude with --dangerously-skip-permissions")
+    opt.add_argument("--firewall", action="store_true",
+                     help="apply a default-deny egress firewall inside the container")
+    opt.add_argument("--test", action="store_true",
+                     help="build, then run each selected toolchain's smoke test")
+    opt.add_argument("--rebuild", action="store_true", help="rebuild image with --no-cache")
+    opt.add_argument("--regen", action="store_true",
+                     help="overwrite .creel/Dockerfile even if hand-edited")
+    opt.add_argument("--no-git", dest="git", action="store_false",
+                     help="do not bind-mount ~/.gitconfig (read-only)")
+    opt.add_argument("--print-dockerfile", action="store_true",
+                     help="print the resolved Dockerfile and exit")
+    return p
+
+
+def split_passthrough(argv):
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, []
+
+
+def normalize_flags(pre):
+    """Make toolchain flags case-insensitive (--Isabelle == --isabelle)."""
+    out = []
+    for tok in pre:
+        if tok.startswith("--") and tok[2:].lower() in BY_NAME:
+            out.append("--" + tok[2:].lower())
+        else:
+            out.append(tok)
+    return out
+
+
+def run_tests(selected, image_tag, gpu_args):
+    tests = [tc for tc in selected if tc.test]
+    if not tests:
+        print("creel: no testable toolchains selected")
+        return 0
+    print(">> testing %d toolchain(s) in %s" % (len(tests), image_tag))
+    width = max(len(tc.name) for tc in tests)
+    failures = 0
+    for tc in tests:
+        cmd = ["docker", "run", "--rm"] + gpu_args + \
+              [image_tag, "bash", "-c", "set -e; " + tc.test]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        ok = res.returncode == 0
+        print("   %-*s  %s" % (width, tc.name, "PASS" if ok else "FAIL"))
+        if not ok:
+            failures += 1
+            tail = (res.stderr or res.stdout).strip().splitlines()[-3:]
+            for line in tail:
+                print("       | " + line)
+    print(">> %d passed, %d failed" % (len(tests) - failures, failures))
+    return 1 if failures else 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    pre, passthru = split_passthrough(argv)
+    args = build_parser().parse_args(normalize_flags(pre))
+
+    project_dir = Path.cwd()
+    project_name = re.sub(r"[^a-z0-9_.-]", "-", project_dir.name.lower()) or "project"
+    image_tag = "creel/" + project_name
+    box = project_dir / ".creel"
+    box.mkdir(exist_ok=True)
+    sel_file = box / "selection.json"
+
+    # Explicit toolchain flags replace the saved set; none recalls it.
+    chosen = [tc.name for tc in TOOLCHAINS if getattr(args, tc.name)]
+    if chosen:
+        sel_file.write_text(json.dumps({"toolchains": chosen}, indent=2) + "\n")
+    elif sel_file.exists():
+        chosen = [n for n in json.loads(sel_file.read_text()).get("toolchains", []) if n in BY_NAME]
+    selected = [BY_NAME[n] for n in chosen]
+
+    content = render_dockerfile(selected, BASE_IMAGE)
+    if args.print_dockerfile:
+        sys.stdout.write(content)
+        return 0
+    guard_write(box, content, args.regen)
+
+    for tc in selected:
+        if tc.note:
+            print(">> note (%s): %s" % (tc.name, tc.note))
+    pretty = " ".join(tc.name for tc in sorted(selected, key=lambda t: ORDER[t.name])) or "none"
+    print(">> building %s [toolchains: %s]" % (image_tag, pretty))
+
+    uid = os.getuid() if hasattr(os, "getuid") else 1000
+    gid = os.getgid() if hasattr(os, "getgid") else 1000
+
+    build = ["docker", "build"]
+    if args.rebuild:
+        build.append("--no-cache")
+    build += ["--build-arg", "BASE_IMAGE=" + BASE_IMAGE,
+              "--build-arg", "HOST_UID=" + str(uid),
+              "--build-arg", "HOST_GID=" + str(gid),
+              "-t", image_tag, str(box)]
+
+    gpu_args = ["--gpus", GPUS] if (GPUS and any(tc.gpu for tc in selected)) else []
+
+    run = ["docker", "run", "--rm", "-it",
+           "--name", "creel-" + project_name,
+           "--hostname", project_name,
+           "-v", "%s:%s" % (project_dir, WORKDIR),
+           "-w", WORKDIR,
+           "-v", "%s:/home/dev/.claude" % AUTH_VOLUME,
+           "-v", "%s:/home/dev/.local/share/claude" % DATA_VOLUME,
+           "--security-opt=no-new-privileges", "--cap-drop=ALL"]
+    run += gpu_args
+
+    gitconfig = Path.home() / ".gitconfig"
+    if args.git and gitconfig.is_file():
+        run += ["-v", "%s:/home/dev/.gitconfig:ro" % gitconfig]
+    for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        if os.environ.get(var):
+            run += ["-e", "%s=%s" % (var, os.environ[var])]
+    if RUN_EXTRA:
+        run += shlex.split(RUN_EXTRA)
+    if args.firewall:
+        run += ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW", "--user", "root",
+                "--entrypoint", "/usr/local/bin/creel-fw-entry"]
+        if FW_ALLOW:
+            run += ["-e", "CREEL_FIREWALL_ALLOW=" + FW_ALLOW]
+    run.append(image_tag)
+
+    if args.shell:
+        run.append("bash")
+    else:
+        run.append("claude")
+        if args.yolo:
+            run.append("--dangerously-skip-permissions")
+        run += passthru
+
+    if DRY_RUN:
+        print("DRY build:", shlex.join(build))
+        if args.test:
+            for tc in selected:
+                if tc.test:
+                    tcmd = ["docker", "run", "--rm"] + gpu_args + [image_tag, "bash", "-c", "set -e; " + tc.test]
+                    print("DRY test %s:" % tc.name, shlex.join(tcmd))
+        else:
+            print("DRY run:  ", shlex.join(run))
+        return 0
+
+    if shutil.which("docker") is None:
+        print("creel: docker not found on PATH", file=sys.stderr)
+        return 1
+    subprocess.run(build, check=True)
+
+    if args.test:
+        return run_tests(selected, image_tag, gpu_args)
+
+    os.execvp("docker", run)  # replace process: hands TTY, signals, exit code to docker
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
