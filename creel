@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,7 +136,9 @@ if echo "$gh" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
   done
 fi
 
-for domain in registry.npmjs.org api.anthropic.com sentry.io statsig.anthropic.com statsig.com ${CREEL_FIREWALL_ALLOW:-}; do
+for domain in registry.npmjs.org api.anthropic.com sentry.io statsig.anthropic.com statsig.com \
+              pypi.org files.pythonhosted.org crates.io static.crates.io index.crates.io \
+              deb.debian.org security.debian.org ${CREEL_FIREWALL_ALLOW:-}; do
   [ -z "$domain" ] && continue
   echo "[creel] resolving $domain..."
   for ip in $(dig +short A "$domain" | grep -E '^[0-9.]+$' || true); do
@@ -168,6 +171,7 @@ echo "[creel] firewall active (default-deny egress, allowlist applied)."
 FW_ENTRY_SH = r"""#!/bin/bash
 set -euo pipefail
 /usr/local/bin/creel-firewall.sh
+mkdir -p /run/creel && touch /run/creel/fw-ready
 exec gosu dev "$@"
 """
 
@@ -226,13 +230,22 @@ TOOLCHAINS = [
               env=(("LD_LIBRARY_PATH", "/usr/local/cuda/lib64"),), gpu=True,
               test="nvcc --version", size="~3-4 GB",
               note="amd64 only; host needs NVIDIA driver + Container Toolkit"),
-    Toolchain("latex", TYPESET, "TeX Live (recommended+extra+science, latexmk, biber)",
+    Toolchain("latex", TYPESET, "TeX Live minimal (base+recommended, latexmk)",
+              apt=("texlive-latex-base", "texlive-latex-recommended",
+                   "texlive-fonts-recommended", "latexmk"),
+              size="moderate",
+              test="echo '\\documentclass{article}\\begin{document}hi\\end{document}' > /tmp/t.tex && cd /tmp && pdflatex -interaction=nonstopmode t.tex >/dev/null 2>&1 && test -f t.pdf && echo OK"),
+    Toolchain("latex-complete", TYPESET, "TeX Live full (adds extra+science, biber)",
               apt=("texlive-latex-base", "texlive-latex-recommended", "texlive-latex-extra",
                    "texlive-fonts-recommended", "texlive-science", "latexmk", "biber"),
               size="large",
-              test="echo '\\documentclass{article}\\begin{document}hi\\end{document}' > /tmp/t.tex && cd /tmp && pdflatex -interaction=nonstopmode t.tex >/dev/null 2>&1 && test -f t.pdf && echo OK"),
-    Toolchain("sage", MATH, "SageMath (distro package)",
+              test="echo '\\documentclass{article}\\begin{document}hi\\end{document}' > /tmp/t.tex && cd /tmp && pdflatex -interaction=nonstopmode t.tex >/dev/null 2>&1 && test -f t.pdf && biber --version >/dev/null && echo OK"),
+    Toolchain("sage", MATH, "SageMath (distro package, no docs/Jupyter)",
               apt=("sagemath",), size="large", note="distro Sage ~9.5; use conda for current",
+              test="sage --version"),
+    Toolchain("sage-complete", MATH, "SageMath + documentation + Jupyter kernel",
+              apt=("sagemath", "sagemath-doc", "sagemath-jupyter"),
+              size="large", note="distro Sage ~9.5; use conda for current",
               test="sage --version"),
     Toolchain("lean", MATH, "Lean 4 via elan (stable)",
               user_run=LEAN_RUN, path=("/home/dev/.elan/bin",),
@@ -350,7 +363,8 @@ def build_parser():
         description="Run Claude Code in a per-project Docker sandbox.",
         epilog="Flags define the FULL toolchain set and are saved to "
                ".creel/selection.json.\nPassing any toolchain flag replaces "
-               "the saved set; running with none recalls it.\nForward args to "
+               "the saved set; running with none recalls it.\nThe session mode "
+               "(--stateful/--stateless) is saved the same way.\nForward args to "
                "claude after `--`, e.g. `creel --rust -- --model opus`.",
     )
     groups = {}
@@ -367,8 +381,17 @@ def build_parser():
     opt.add_argument("--shell", action="store_true", help="open bash instead of claude")
     opt.add_argument("--yolo", action="store_true",
                      help="launch claude with --dangerously-skip-permissions")
-    opt.add_argument("--firewall", action="store_true",
-                     help="apply a default-deny egress firewall inside the container")
+    opt.add_argument("--firewall", action=argparse.BooleanOptionalAction, default=True,
+                     help="default-deny egress firewall inside the container (default: on)")
+    opt.add_argument("--stateful", action="store_true",
+                     help="reuse a persistent per-project container so in-session "
+                          "installs survive (saved; the default)")
+    opt.add_argument("--stateless", action="store_true",
+                     help="run a throwaway container instead (saved)")
+    opt.add_argument("--fresh", action="store_true",
+                     help="discard the persistent container and start over")
+    opt.add_argument("--stop", action="store_true",
+                     help="stop the persistent container and exit")
     opt.add_argument("--test", action="store_true",
                      help="build, then run each selected toolchain's smoke test")
     opt.add_argument("--rebuild", action="store_true", help="rebuild image with --no-cache")
@@ -434,12 +457,34 @@ def main(argv=None):
     box.mkdir(exist_ok=True)
     sel_file = box / "selection.json"
 
-    # Explicit toolchain flags replace the saved set; none recalls it.
-    chosen = [tc.name for tc in TOOLCHAINS if getattr(args, tc.name)]
-    if chosen:
-        sel_file.write_text(json.dumps({"toolchains": chosen}, indent=2) + "\n")
-    elif sel_file.exists():
-        chosen = [n for n in json.loads(sel_file.read_text()).get("toolchains", []) if n in BY_NAME]
+    ctr = "creel-" + project_name
+
+    if args.stateful and args.stateless:
+        print("creel: --stateful and --stateless are mutually exclusive", file=sys.stderr)
+        return 2
+
+    if args.stop:
+        stop = ["docker", "stop", ctr]
+        if DRY_RUN:
+            print("DRY stop: ", shlex.join(stop))
+            return 0
+        res = subprocess.run(stop, capture_output=True, text=True)
+        print(">> stopped " + ctr if res.returncode == 0
+              else "creel: no container to stop")
+        return 0
+
+    # Explicit toolchain flags replace the saved set; none recalls it. The
+    # session mode is saved alongside, but a mode flag alone never touches
+    # the saved toolchain set.
+    saved = json.loads(sel_file.read_text()) if sel_file.exists() else {}
+    chosen = [tc.name for tc in TOOLCHAINS if getattr(args, tc.name.replace("-", "_"))]
+    if not chosen:
+        chosen = [n for n in saved.get("toolchains", []) if n in BY_NAME]
+    mode = ("stateful" if args.stateful else
+            "stateless" if args.stateless else saved.get("mode", "stateful"))
+    state = {"toolchains": chosen, "mode": mode}
+    if state != saved:
+        sel_file.write_text(json.dumps(state, indent=2) + "\n")
     selected = [BY_NAME[n] for n in chosen]
 
     content = render_dockerfile(selected, BASE_IMAGE)
@@ -467,38 +512,53 @@ def main(argv=None):
 
     gpu_args = ["--gpus", GPUS] if (GPUS and any(tc.gpu for tc in selected)) else []
 
-    run = ["docker", "run", "--rm", "-it",
-           "--name", "creel-" + project_name,
-           "--hostname", project_name,
-           "-v", "%s:%s" % (project_dir, WORKDIR),
-           "-w", WORKDIR,
-           "-v", "%s:/home/dev/.claude" % AUTH_VOLUME,
-           "-v", "%s:/home/dev/.local/share/claude" % DATA_VOLUME,
-           "--security-opt=no-new-privileges", "--cap-drop=ALL"]
-    run += gpu_args
+    common = ["--name", ctr,
+              "--hostname", project_name,
+              "-v", "%s:%s" % (project_dir, WORKDIR),
+              "-w", WORKDIR,
+              "-v", "%s:/home/dev/.claude" % AUTH_VOLUME,
+              "-v", "%s:/home/dev/.local/share/claude" % DATA_VOLUME,
+              "--security-opt=no-new-privileges", "--cap-drop=ALL"]
+    common += gpu_args
 
     gitconfig = Path.home() / ".gitconfig"
     if args.git and gitconfig.is_file():
-        run += ["-v", "%s:/home/dev/.gitconfig:ro" % gitconfig]
+        common += ["-v", "%s:/home/dev/.gitconfig:ro" % gitconfig]
+    if RUN_EXTRA:
+        common += shlex.split(RUN_EXTRA)
+
+    fw_args = []
+    if args.firewall:
+        fw_args = ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW", "--user", "root",
+                   "--entrypoint", "/usr/local/bin/creel-fw-entry"]
+        if FW_ALLOW:
+            fw_args += ["-e", "CREEL_FIREWALL_ALLOW=" + FW_ALLOW]
+
+    env_args = []
     for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
         if os.environ.get(var):
-            run += ["-e", "%s=%s" % (var, os.environ[var])]
-    if RUN_EXTRA:
-        run += shlex.split(RUN_EXTRA)
-    if args.firewall:
-        run += ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW", "--user", "root",
-                "--entrypoint", "/usr/local/bin/creel-fw-entry"]
-        if FW_ALLOW:
-            run += ["-e", "CREEL_FIREWALL_ALLOW=" + FW_ALLOW]
-    run.append(image_tag)
+            env_args += ["-e", "%s=%s" % (var, os.environ[var])]
 
     if args.shell:
-        run.append("bash")
+        cmd = ["bash"]
     else:
-        run.append("claude")
+        cmd = ["claude"]
         if args.yolo:
-            run.append("--dangerously-skip-permissions")
-        run += passthru
+            cmd.append("--dangerously-skip-permissions")
+        cmd += passthru
+
+    # stateless: one throwaway container per session
+    run = ["docker", "run", "--rm", "-it"] + common + env_args + fw_args + [image_tag] + cmd
+
+    # stateful: a keep-alive container created once, then one `docker exec` per
+    # session, so per-session choices (--shell, --yolo, env, passthrough args)
+    # stay flexible. /run/creel is a tmpfs so the firewall-ready sentinel
+    # cannot go stale across container restarts.
+    create = ["docker", "run", "-d", "--init"] + common
+    if args.firewall:
+        create += ["--tmpfs", "/run/creel"]
+    create += fw_args + [image_tag, "sleep", "infinity"]
+    execv = ["docker", "exec", "-it", "-u", "dev", "-w", WORKDIR] + env_args + [ctr] + cmd
 
     if DRY_RUN:
         print("DRY build:", shlex.join(build))
@@ -507,6 +567,9 @@ def main(argv=None):
                 if tc.test:
                     tcmd = ["docker", "run", "--rm"] + gpu_args + [image_tag, "bash", "-c", "set -e; " + tc.test]
                     print("DRY test %s:" % tc.name, shlex.join(tcmd))
+        elif mode == "stateful":
+            print("DRY create:", shlex.join(create))
+            print("DRY exec:  ", shlex.join(execv))
         else:
             print("DRY run:  ", shlex.join(run))
         return 0
@@ -519,7 +582,58 @@ def main(argv=None):
     if args.test:
         return run_tests(selected, image_tag, gpu_args)
 
-    os.execvp("docker", run)  # replace process: hands TTY, signals, exit code to docker
+    if args.fresh:
+        subprocess.run(["docker", "rm", "-f", ctr],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if mode == "stateless":
+        os.execvp("docker", run)  # replace process: hands TTY, signals, exit code to docker
+
+    # ---------------- stateful session ----------------
+    info = subprocess.run(["docker", "inspect", "-f",
+                           "{{.State.Running}} {{.Image}} {{.Path}}", ctr],
+                          capture_output=True, text=True)
+    if info.returncode == 0:
+        running, ctr_img, ctr_path = info.stdout.split()
+        img = subprocess.run(["docker", "image", "inspect", "-f", "{{.Id}}", image_tag],
+                             capture_output=True, text=True).stdout.strip()
+        if ctr_img != img:
+            print(">> warning: %s predates the current image (toolchains changed?); "
+                  "`creel --fresh` recreates it, discarding in-container state" % ctr,
+                  file=sys.stderr)
+        has_fw = ctr_path.endswith("creel-fw-entry")
+        if has_fw != args.firewall:
+            print(">> warning: %s was created with the firewall %s; "
+                  "`creel --fresh` applies the change" % (ctr, "on" if has_fw else "off"),
+                  file=sys.stderr)
+        fw_wait = has_fw and running != "true"
+        if running != "true":
+            subprocess.run(["docker", "start", ctr], check=True, stdout=subprocess.DEVNULL)
+    else:
+        subprocess.run(create, check=True, stdout=subprocess.DEVNULL)
+        fw_wait = bool(args.firewall)
+
+    if fw_wait:
+        # The entrypoint applies iptables rules before touching the sentinel;
+        # exec'ing earlier would run the session with unrestricted egress.
+        print(">> waiting for firewall...")
+        for _ in range(150):
+            if subprocess.run(["docker", "exec", ctr, "test", "-e", "/run/creel/fw-ready"],
+                              capture_output=True).returncode == 0:
+                break
+            alive = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", ctr],
+                                   capture_output=True, text=True).stdout.strip()
+            if alive != "true":
+                print("creel: container exited while applying the firewall; "
+                      "see `docker logs %s`" % ctr, file=sys.stderr)
+                return 1
+            time.sleep(0.2)
+        else:
+            print("creel: firewall did not come up; see `docker logs %s`" % ctr,
+                  file=sys.stderr)
+            return 1
+
+    os.execvp("docker", execv)  # replace process: hands TTY, signals, exit code to docker
 
 
 if __name__ == "__main__":

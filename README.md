@@ -24,7 +24,7 @@ Two reasons you might want Claude Code in a container:
 ## Requirements
 
 - Docker (daemon running, current user able to run `docker`)
-- Python 3.8+ (standard library only, nothing to `pip install`)
+- Python 3.9+ (standard library only, nothing to `pip install`)
 - A Claude Code login: a Claude subscription (Pro/Max) or an Anthropic API key
 
 ---
@@ -70,7 +70,7 @@ creel                      # reuses Rust + Python
 creel --go                 # image now has ONLY Go
 ```
 
-The saved set lives in `.creel/selection.json`.
+The saved set lives in `.creel/selection.json`, together with the session mode (see [Session state](#session-state)).
 
 ### Options
 
@@ -78,7 +78,11 @@ The saved set lives in `.creel/selection.json`.
 |------|--------|
 | `--shell` | Open `bash` in the container instead of launching `claude` |
 | `--yolo` | Launch `claude` with `--dangerously-skip-permissions` |
-| `--firewall` | Apply a default-deny egress firewall inside the container |
+| `--no-firewall` | Disable the default-deny egress firewall (on by default) |
+| `--stateless` | Use a throwaway container per session (saved per project) |
+| `--stateful` | Reuse a persistent per-project container (saved; the default) |
+| `--fresh` | Discard the persistent container and start over |
+| `--stop` | Stop the persistent container and exit |
 | `--test` | Build, then run each selected toolchain's smoke test and report |
 | `--rebuild` | Rebuild the image with `--no-cache` |
 | `--regen` | Overwrite `.creel/Dockerfile` even if it was hand-edited |
@@ -98,12 +102,14 @@ creel -- --help            # show Claude Code's own help
 ### Examples
 
 ```sh
-creel --python --latex               # data work plus a TeX Live for reports
+creel --python --latex               # data work plus a minimal TeX Live for reports
+creel --python --latex-complete      # same, but the full TeX Live set
 creel --lean --isabelle              # a proof-assistant workbench
 creel --cuda --python                # GPU work (needs the NVIDIA Container Toolkit)
 creel --rust --gcc --test            # build, then smoke-test each toolchain
-creel --rust --yolo --firewall       # unattended, sandboxed, default-deny egress
+creel --rust --yolo                  # unattended; the default-deny firewall is already on
 creel --shell                        # poke around the current project's image
+creel --stop                         # stop this project's persistent container
 CREEL_DRY_RUN=1 creel --go       # show the docker commands without running
 ```
 
@@ -111,7 +117,7 @@ CREEL_DRY_RUN=1 creel --go       # show the docker commands without running
 
 ## Supported toolchains
 
-Fifteen toolchains across four categories. "Method" is how each is installed: `apt` (Debian package), `npm` (global npm install on the Node base), or `script` (upstream installer, run as root or as the unprivileged `dev` user).
+Seventeen toolchains across four categories. "Method" is how each is installed: `apt` (Debian package), `npm` (global npm install on the Node base), or `script` (upstream installer, run as root or as the unprivileged `dev` user).
 
 ### Languages / compilers
 
@@ -137,13 +143,15 @@ Fifteen toolchains across four categories. "Method" is how each is installed: `a
 
 | Flag | Installs | Method | Notes |
 |------|----------|--------|-------|
-| `--latex` | TeX Live (recommended + extra + science, latexmk, biber) | apt | large |
+| `--latex` | TeX Live minimal (base + recommended, latexmk) | apt | moderate |
+| `--latex-complete` | TeX Live full (adds extra + science, biber) | apt | large |
 
 ### Math / proof assistants
 
 | Flag | Installs | Method | Notes |
 |------|----------|--------|-------|
-| `--sage` | SageMath (distro package) | apt | large; distro Sage ~9.5, use conda for current |
+| `--sage` | SageMath (distro package, no docs/Jupyter) | apt | large; distro Sage ~9.5, use conda for current |
+| `--sage-complete` | SageMath + documentation + Jupyter kernel | apt | large; distro Sage ~9.5, use conda for current |
 | `--lean` | Lean 4 via elan (stable) | script (user) |  |
 | `--isabelle` | Isabelle2025-2 bundle (arch-aware download) | script (root) | ~1.2 GB |
 | `--tamarin` | Tamarin prover via Linuxbrew (+ maude, graphviz) | apt, script (user) | heavy/slow |
@@ -151,6 +159,7 @@ Fifteen toolchains across four categories. "Method" is how each is installed: `a
 A few of these deserve a word:
 
 - **`--gcc` vs `--c`.** `--gcc` is a minimal GNU C toolchain. `--c` is a fuller set that adds clang, cmake, and valgrind. They combine without conflict.
+- **`--latex` vs `--latex-complete`.** `--latex` covers everyday documents (base + recommended packages, latexmk); `--latex-complete` adds `texlive-latex-extra`, `texlive-science`, and biber for bibliographies and heavier package needs. Likewise `--sage-complete` adds the Sage documentation and Jupyter kernel on top of `--sage`; the core `sagemath` package is monolithic, so `--sage` is already as small as Debian offers.
 - **`--go` and `--sage`** use the Debian package for a zero-maintenance, arch-agnostic install, which means they track the base image's distro version rather than the latest upstream. For current Go, swap in the official tarball; for current Sage, use conda.
 - **`--isabelle`** downloads the official bundle and picks the right architecture from `dpkg --print-architecture` (amd64 or arm64). The version is pinned in the script (see [Maintenance](#maintenance)).
 - **`--cuda`** installs the CUDA toolkit (nvcc plus libraries), not a driver. The driver comes from the host through the NVIDIA Container Toolkit, and `creel` adds `--gpus` to `docker run` automatically. It is amd64-only and the toolkit version is pinned (see [CUDA and GPUs](#cuda-and-gpus)).
@@ -167,7 +176,7 @@ Claude Code stores its state under `~/.claude` (config, plus `.credentials.json`
 
 You can authenticate in any of three ways:
 
-1. **OAuth login (subscription).** On first use, run `creel --shell`, then `claude` inside the container, and follow the printed URL/code flow. The token persists in the `creel-auth` volume, so you only do this once. Or authenticate in any single project and every project inherits it.
+1. **OAuth login (subscription).** On first use, run `creel --no-firewall --shell` (the login flow touches domains outside the firewall allowlist), then `claude` inside the container, and follow the printed URL/code flow. The token persists in the `creel-auth` volume, so you only do this once. Or authenticate in any single project and every project inherits it.
 2. **API key.** Export `ANTHROPIC_API_KEY` on the host; `creel` forwards it into the container.
 3. **OAuth token (subscription, headless).** Run `claude setup-token` on the host to mint a `CLAUDE_CODE_OAUTH_TOKEN`, export it, and `creel` forwards it.
 
@@ -197,6 +206,22 @@ export CREEL_RUN_EXTRA="-v $HOME/.claude:/home/dev/.claude"
 
 ---
 
+## Session state
+
+By default sessions are **stateful**: the first run creates a persistent per-project container (`creel-<project>`) kept alive in the background, and every session is a `docker exec` into it. Anything written inside the container between sessions survives: `pip install --user`, `cargo install`, npm prefixes, shell history, dotfiles, scratch files outside the project.
+
+What does *not* persist or work:
+
+- **System packages.** The hardening (`--cap-drop=ALL`, `no-new-privileges`) blocks `sudo`, so `apt install` fails at run time by design. Toolchains belong in the image; select the flag and rebuild.
+- **Toolchain changes.** The persistent container keeps running on the image it was created from. After changing the selection, `creel` warns and keeps the old container; run `creel --fresh` to recreate it on the new image (discarding in-container state).
+- **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, and the firewall on/off state are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
+
+The keep-alive container is just an idle `sleep`; stop it any time with `creel --stop` (the next run restarts it, state intact).
+
+Prefer the old throwaway behavior? `creel --stateless` switches the project to one-shot containers (`docker run --rm`); `creel --stateful` switches back. Like toolchain flags, the mode is saved in `.creel/selection.json` and recalled on later runs.
+
+---
+
 ## Security model
 
 The container is meant to be a boundary, especially in `--yolo` mode:
@@ -206,7 +231,7 @@ The container is meant to be a boundary, especially in `--yolo` mode:
 - Git identity is forwarded read-only (`~/.gitconfig`, not a secret). SSH keys and cloud credentials are deliberately **not** mounted. Pushing to a remote needs a scoped token you supply on purpose.
 - Anything reachable inside the container, including the credentials in the mounted `~/.claude`, is readable by the agent. Use this for trusted repositories.
 
-By default the container allows normal network egress. Pass `--firewall` to lock outbound traffic down to an allowlist (Anthropic API, npm, GitHub, plus anything you add). See [Firewall](#firewall) for what it does and its trade-offs.
+By default outbound traffic is locked down to a default-deny egress firewall with an allowlist (Anthropic API, npm, GitHub, common package registries, plus anything you add). Pass `--no-firewall` to allow normal network egress instead. See [Firewall](#firewall) for what it does and its trade-offs.
 
 ---
 
@@ -252,20 +277,20 @@ The CUDA test is `nvcc --version`, which validates the toolkit without requiring
 
 ## Firewall
 
-`--firewall` applies a default-deny egress firewall inside the container, so the agent can reach only an allowlist and nothing else. This is the strongest of the sandboxing options and pairs naturally with `--yolo`.
+A default-deny egress firewall is applied inside the container **by default**, so the agent can reach only an allowlist and nothing else. This is the strongest of the sandboxing options and pairs naturally with `--yolo`. Pass `--no-firewall` to disable it for a session.
 
-What it allows by default: DNS, loopback, the local host network, established connections, GitHub's published IP ranges (fetched from the `/meta` API so `git` and `gh` work), and these resolved domains: `registry.npmjs.org`, `api.anthropic.com`, `sentry.io`, `statsig.anthropic.com`, `statsig.com`. Everything else outbound is rejected. Add more with `CREEL_FIREWALL_ALLOW`:
+What it allows by default: DNS, loopback, the local host network, established connections, GitHub's published IP ranges (fetched from the `/meta` API so `git` and `gh` work), and these resolved domains: `registry.npmjs.org`, `api.anthropic.com`, `sentry.io`, `statsig.anthropic.com`, `statsig.com`, plus the common package registries `pypi.org`, `files.pythonhosted.org`, `crates.io`, `static.crates.io`, `index.crates.io`, `deb.debian.org`, `security.debian.org`. Everything else outbound is rejected. Add more with `CREEL_FIREWALL_ALLOW`:
 
 ```sh
-CREEL_FIREWALL_ALLOW="pypi.org files.pythonhosted.org crates.io" creel --firewall
+CREEL_FIREWALL_ALLOW="proxy.golang.org sum.golang.org" creel
 ```
 
-How it works: the firewall machinery (a small init script plus `iptables`/`ipset`/`gosu`) is baked into every image, so `--firewall` is a pure run-time toggle needing no rebuild. When set, the container is granted `NET_ADMIN` and `NET_RAW`, starts as root just long enough for an entrypoint to apply the `iptables` rules, then drops to the unprivileged `dev` user via `gosu` before running Claude Code. The init script fails closed: if it cannot confirm that egress is actually restricted (it verifies that `example.com` is unreachable), the container aborts rather than running unprotected.
+How it works: the firewall machinery (a small init script plus `iptables`/`ipset`/`gosu`) is baked into every image, so the firewall is a pure run-time toggle needing no rebuild. When on, the container is granted `NET_ADMIN` and `NET_RAW`, starts as root just long enough for an entrypoint to apply the `iptables` rules, then drops to the unprivileged `dev` user via `gosu` before running Claude Code. The init script fails closed: if it cannot confirm that egress is actually restricted (it verifies that `example.com` is unreachable), the container aborts rather than running unprotected. In stateful mode, `creel` additionally waits for the entrypoint's ready signal before exec'ing into the container, so a session never starts ahead of the rules.
 
 Two things to know:
 
-- **Authenticate first.** The OAuth login flow may touch domains outside the allowlist. Log in once without `--firewall` (the token persists in the auth volume), then use `--firewall` for work sessions, which only need `api.anthropic.com`.
-- **Trade-off with capabilities.** `--firewall` necessarily adds `NET_ADMIN`/`NET_RAW`, which the default posture drops. This is a deliberate exchange: slightly more container capability in return for a hard egress boundary. The rest of the hardening (unprivileged final user, `no-new-privileges`, everything else dropped) is unchanged.
+- **Authenticate first.** The OAuth login flow may touch domains outside the allowlist. Log in once with `--no-firewall` (the token persists in the auth volume); work sessions only need `api.anthropic.com`.
+- **Trade-off with capabilities.** The firewall necessarily adds `NET_ADMIN`/`NET_RAW`, which the fully-locked posture drops. This is a deliberate exchange: slightly more container capability in return for a hard egress boundary. The rest of the hardening (unprivileged final user, `no-new-privileges`, everything else dropped) is unchanged. If you prefer zero added capabilities over the egress boundary, run with `--no-firewall`.
 
 If a session behaves as though the network is down, it usually means something it needs is not on the allowlist; add the domain via `CREEL_FIREWALL_ALLOW` and rerun.
 
@@ -282,7 +307,7 @@ All customization is via environment variables, no editing required:
 | `CREEL_DATA_VOLUME` | `creel-data` | Named volume for session/history data |
 | `CREEL_RUN_EXTRA` | (empty) | Extra `docker run` flags, split with shell quoting rules |
 | `CREEL_GPUS` | `all` | Value for `--gpus` when a GPU toolchain is selected; empty omits it |
-| `CREEL_FIREWALL_ALLOW` | (empty) | Extra domains to allow under `--firewall`, space-separated |
+| `CREEL_FIREWALL_ALLOW` | (empty) | Extra domains to allow through the firewall, space-separated |
 | `CREEL_DRY_RUN` | (unset) | If set, print the `docker build`/`docker run` commands and exit |
 | `ANTHROPIC_API_KEY` | (unset) | Forwarded into the container if present |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (unset) | Forwarded into the container if present |
@@ -344,7 +369,7 @@ When you pull a newer `creel`, the next run refreshes each project's `.creel/Doc
 `creel` creates a `.creel/` directory containing:
 
 - `Dockerfile` — the generated build definition
-- `selection.json` — the saved toolchain set for this project
+- `selection.json` — the saved toolchain set and session mode for this project
 - `.dockerfile.sha256` — the checksum sidecar for the edit guard
 
 Add `.creel/` to your project `.gitignore`, or commit `Dockerfile` and `selection.json` if you want to pin the environment for collaborators (in that case still ignore `.dockerfile.sha256`).
@@ -368,6 +393,8 @@ Add `.creel/` to your project `.gitignore`, or commit `Dockerfile` and `selectio
 - **Auth prompt every time** — the `creel-auth` volume may not be persisting. Confirm `docker volume ls` shows it and that nothing removed it between runs.
 - **Tamarin build is slow or fails** — Linuxbrew in Docker is finicky and slow on first build. Rerun; if it keeps failing, that flag is the most fragile and the least essential to keep.
 - **Dockerfile changes are ignored** — you probably hand-edited it, so the guard is protecting your edits. Use `--regen` to overwrite, or edit the script's template instead.
+- **A newly added toolchain is missing from the session** — in stateful mode the persistent container keeps running on its original image. Run `creel --fresh` to recreate it on the current image (this discards in-container state).
+- **Session behaves as though the network is down** — the default firewall is blocking a domain the session needs. Add it via `CREEL_FIREWALL_ALLOW`, or run with `--no-firewall` if you don't want the egress boundary.
 
 ---
 
