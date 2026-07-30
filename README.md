@@ -117,7 +117,7 @@ CREEL_DRY_RUN=1 creel --go       # show the docker commands without running
 
 ## Supported toolchains
 
-Seventeen toolchains across four categories. "Method" is how each is installed: `apt` (Debian package), `npm` (global npm install on the Node base), or `script` (upstream installer, run as root or as the unprivileged `dev` user).
+Eighteen toolchains across four categories. "Method" is how each is installed: `apt` (Debian package), `npm` (global npm install on the Node base), or `script` (upstream installer, run as root or as the unprivileged `dev` user).
 
 ### Languages / compilers
 
@@ -132,6 +132,7 @@ Seventeen toolchains across four categories. "Method" is how each is installed: 
 | `--go` | Go toolchain (distro golang-go) | apt | distro Go (1.19 on bookworm) |
 | `--java` | JDK + Maven (default-jdk, maven) | apt |  |
 | `--csharp` | .NET SDK (LTS, dotnet-install into ~/.dotnet) | apt, script (user) |  |
+| `--qsharp` | Q# (Quantum Development Kit, pip qsharp) | apt, script (user) | Python module, no CLI |
 
 ### GPU / accelerators
 
@@ -163,6 +164,7 @@ A few of these deserve a word:
 - **`--go` and `--sage`** use the Debian package for a zero-maintenance, arch-agnostic install, which means they track the base image's distro version rather than the latest upstream. For current Go, swap in the official tarball; for current Sage, use conda.
 - **`--isabelle`** downloads the official bundle and picks the right architecture from `dpkg --print-architecture` (amd64 or arm64). The version is pinned in the script (see [Maintenance](#maintenance)).
 - **`--cuda`** installs the CUDA toolkit (nvcc plus libraries), not a driver. The driver comes from the host through the NVIDIA Container Toolkit, and `creel` adds `--gpus` to `docker run` automatically. It is amd64-only and the toolkit version is pinned (see [CUDA and GPUs](#cuda-and-gpus)).
+- **`--qsharp`** installs the modern Rust-based Quantum Development Kit as a Python package (the deprecated .NET/iqsharp QDK is not used). It ships no standalone compiler CLI: run Q# through Python, e.g. `python3 -c 'import qsharp; print(qsharp.eval("..."))'` or `qsharp.run()` on a `.qs` file's contents. It combines naturally with `--python` for notebooks and scripting.
 - **`--tamarin`** is the heavy one. Tamarin ships no Debian package, so the flag bootstraps Linuxbrew and installs via the official tap, which drags in GHC and maude and can take many minutes on first build. Reach for it only when a project needs it.
 
 ---
@@ -381,7 +383,7 @@ Add `.creel/` to your project `.gitignore`, or commit `Dockerfile` and `selectio
 - **`--print-dockerfile`** renders the resolved Dockerfile to stdout without building, useful for inspection or piping into a linter.
 - **`CREEL_DRY_RUN=1`** prints the exact `docker build` and `docker run` commands instead of executing them. Handy for understanding what the tool does or for debugging.
 - **`selection.json`** is plain JSON, so other tooling can read or generate it.
-- **Network at build time.** The script-installed toolchains fetch from `sh.rustup.rs`, `dot.net`, `raw.githubusercontent.com`, `isabelle.in.tum.de`, `developer.download.nvidia.com`, and Homebrew. Provisioning them needs normal outbound network during `docker build`. (This is the build; the `--firewall` allowlist governs the running session, not the build.)
+- **Network at build time.** The script-installed toolchains fetch from `sh.rustup.rs`, `dot.net`, `pypi.org`, `raw.githubusercontent.com`, `isabelle.in.tum.de`, `developer.download.nvidia.com`, and Homebrew. Provisioning them needs normal outbound network during `docker build`. (This is the build; the `--firewall` allowlist governs the running session, not the build.)
 - **Image size.** Heavy toolchains (`--latex`, `--sage`, `--isabelle`, `--tamarin`, `--cuda`) add minutes and 1 to 4 GB each. Because images are per-project, this only affects projects that ask for them.
 
 ---

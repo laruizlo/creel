@@ -59,6 +59,10 @@ DOTNET_RUN = r"""RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dot
  && bash /tmp/dotnet.sh --channel LTS --install-dir "$HOME/.dotnet" \
  && rm /tmp/dotnet.sh"""
 
+# Modern Rust-based QDK: a small pip wheel, no standalone CLI. The base
+# python is externally managed (PEP 668), hence --break-system-packages.
+QSHARP_RUN = r"""RUN pip3 install --user --break-system-packages qsharp"""
+
 TAMARIN_RUN = r"""RUN NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
  && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" \
  && brew install tamarin-prover/tap/tamarin-prover"""
@@ -225,6 +229,10 @@ TOOLCHAINS = [
               apt=("libicu72",), user_run=DOTNET_RUN,
               path=("/home/dev/.dotnet",), env=(("DOTNET_ROOT", "/home/dev/.dotnet"),),
               test="dotnet --version"),
+    Toolchain("qsharp", LANG, "Q# (Quantum Development Kit, pip qsharp)",
+              apt=("python3", "python3-pip"), user_run=QSHARP_RUN,
+              note="Python module, no CLI: use python3 -c 'import qsharp; ...'",
+              test="python3 -c 'import qsharp; print(qsharp.eval(\"1+1\"))'"),
     Toolchain("cuda", GPU, "CUDA toolkit 12.8 (nvcc + libraries), needs --gpus at run time",
               root_run=CUDA_RUN, path=("/usr/local/cuda/bin",),
               env=(("LD_LIBRARY_PATH", "/usr/local/cuda/lib64"),), gpu=True,
