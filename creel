@@ -537,7 +537,10 @@ def main(argv=None):
 
     fw_args = []
     if args.firewall:
-        fw_args = ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW", "--user", "root",
+        # SETUID/SETGID are required by the entrypoint's `gosu dev`; with
+        # --cap-drop=ALL they are not implied by running as root.
+        fw_args = ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
+                   "--cap-add=SETUID", "--cap-add=SETGID", "--user", "root",
                    "--entrypoint", "/usr/local/bin/creel-fw-entry"]
         if FW_ALLOW:
             fw_args += ["-e", "CREEL_FIREWALL_ALLOW=" + FW_ALLOW]
