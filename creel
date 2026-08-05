@@ -34,6 +34,7 @@ RUN_EXTRA = os.environ.get("CREEL_RUN_EXTRA", "")
 DRY_RUN = bool(os.environ.get("CREEL_DRY_RUN"))
 GPUS = os.environ.get("CREEL_GPUS", "all")             # --gpus value for CUDA
 FW_ALLOW = os.environ.get("CREEL_FIREWALL_ALLOW", "")  # extra allowed domains
+PROVISION_ENV = os.environ.get("CREEL_PROVISION")      # default for --provision
 
 # Base tooling, always present. Includes the firewall machinery so that
 # --firewall is a pure run-time toggle needing no rebuild.
@@ -279,7 +280,7 @@ def _dedup(seq):
     return out
 
 
-def render_dockerfile(selected, base_image):
+def render_dockerfile(selected, base_image, provision=""):
     """Render a minimal Dockerfile for the selected toolchains (canonical order)."""
     selected = sorted(selected, key=lambda tc: ORDER[tc.name])
 
@@ -325,6 +326,12 @@ def render_dockerfile(selected, base_image):
     L.append("")
     for r in user_runs:
         L.append(r)
+        L.append("")
+    if provision:
+        # Last RUN layer: editing the provision command never invalidates
+        # the toolchain layers above.
+        L.append("# --- extra user provisioning (--provision) ------------------------")
+        L.append("RUN " + provision)
         L.append("")
     for k, v in env_pairs:
         L.append('ENV %s="%s"' % (k, v))
@@ -372,8 +379,8 @@ def build_parser():
         epilog="Flags define the FULL toolchain set and are saved to "
                ".creel/selection.json.\nPassing any toolchain flag replaces "
                "the saved set; running with none recalls it.\nThe session mode "
-               "(--stateful/--stateless) is saved the same way.\nForward args to "
-               "claude after `--`, e.g. `creel --rust -- --model opus`.",
+               "(--stateful/--stateless) and --provision are saved the same way.\n"
+               "Forward args to claude after `--`, e.g. `creel --rust -- --model opus`.",
     )
     groups = {}
     for cat in (LANG, GPU, TYPESET, MATH):
@@ -400,6 +407,10 @@ def build_parser():
                      help="discard the persistent container and start over")
     opt.add_argument("--stop", action="store_true",
                      help="stop the persistent container and exit")
+    opt.add_argument("--provision", metavar="CMD", default=None,
+                     help="shell command baked into the image as a final user RUN "
+                          "layer, e.g. 'cargo install cargo-mutants' (saved; "
+                          "--provision '' clears it)")
     opt.add_argument("--test", action="store_true",
                      help="build, then run each selected toolchain's smoke test")
     opt.add_argument("--rebuild", action="store_true", help="rebuild image with --no-cache")
@@ -490,12 +501,15 @@ def main(argv=None):
         chosen = [n for n in saved.get("toolchains", []) if n in BY_NAME]
     mode = ("stateful" if args.stateful else
             "stateless" if args.stateless else saved.get("mode", "stateful"))
-    state = {"toolchains": chosen, "mode": mode}
+    provision = (args.provision if args.provision is not None else
+                 PROVISION_ENV if PROVISION_ENV is not None else
+                 saved.get("provision", ""))
+    state = {"toolchains": chosen, "mode": mode, "provision": provision}
     if state != saved:
         sel_file.write_text(json.dumps(state, indent=2) + "\n")
     selected = [BY_NAME[n] for n in chosen]
 
-    content = render_dockerfile(selected, BASE_IMAGE)
+    content = render_dockerfile(selected, BASE_IMAGE, provision)
     if args.print_dockerfile:
         sys.stdout.write(content)
         return 0
@@ -506,6 +520,8 @@ def main(argv=None):
             print(">> note (%s): %s" % (tc.name, tc.note))
     pretty = " ".join(tc.name for tc in sorted(selected, key=lambda t: ORDER[t.name])) or "none"
     print(">> building %s [toolchains: %s]" % (image_tag, pretty))
+    if provision:
+        print(">> provision: " + provision)
 
     uid = os.getuid() if hasattr(os, "getuid") else 1000
     gid = os.getgid() if hasattr(os, "getgid") else 1000

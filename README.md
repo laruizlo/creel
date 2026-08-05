@@ -70,7 +70,19 @@ creel                      # reuses Rust + Python
 creel --go                 # image now has ONLY Go
 ```
 
-The saved set lives in `.creel/selection.json`, together with the session mode (see [Session state](#session-state)).
+The saved set lives in `.creel/selection.json`, together with the session mode (see [Session state](#session-state)) and the provision command (see below).
+
+### Extra provisioning
+
+`--provision CMD` bakes one extra shell command into the image as a final `RUN` layer, executed as the unprivileged `dev` user at build time:
+
+```sh
+creel --rust --provision 'cargo install cargo-mutants'
+```
+
+Use it for tools that live in your home directory (`cargo install`, `pip install --user`, `npm` prefixes) and that you want to survive container recreation: unlike an in-session install, a provisioned tool is part of the image, so `--fresh` and `--stateless` runs keep it. Because it is the last layer, changing the command rebuilds only that layer, never the toolchains above it.
+
+Like the session mode, the command is saved in `.creel/selection.json` and recalled on later runs; passing `--provision` replaces it, and `--provision ''` clears it. Chain several tools with `&&`. The `CREEL_PROVISION` environment variable acts as the flag's default when the flag is absent.
 
 ### Options
 
@@ -83,6 +95,7 @@ The saved set lives in `.creel/selection.json`, together with the session mode (
 | `--stateful` | Reuse a persistent per-project container (saved; the default) |
 | `--fresh` | Discard the persistent container and start over |
 | `--stop` | Stop the persistent container and exit |
+| `--provision CMD` | Bake `CMD` into the image as a final user `RUN` layer (saved per project) |
 | `--test` | Build, then run each selected toolchain's smoke test and report |
 | `--rebuild` | Rebuild the image with `--no-cache` |
 | `--regen` | Overwrite `.creel/Dockerfile` even if it was hand-edited |
@@ -107,6 +120,7 @@ creel --python --latex-complete      # same, but the full TeX Live set
 creel --lean --isabelle              # a proof-assistant workbench
 creel --cuda --python                # GPU work (needs the NVIDIA Container Toolkit)
 creel --rust --gcc --test            # build, then smoke-test each toolchain
+creel --rust --provision 'cargo install cargo-mutants'   # extra tool, baked in
 creel --rust --yolo                  # unattended; the default-deny firewall is already on
 creel --shell                        # poke around the current project's image
 creel --stop                         # stop this project's persistent container
@@ -215,7 +229,7 @@ By default sessions are **stateful**: the first run creates a persistent per-pro
 What does *not* persist or work:
 
 - **System packages.** The hardening (`--cap-drop=ALL`, `no-new-privileges`) blocks `sudo`, so `apt install` fails at run time by design. Toolchains belong in the image; select the flag and rebuild.
-- **Toolchain changes.** The persistent container keeps running on the image it was created from. After changing the selection, `creel` warns and keeps the old container; run `creel --fresh` to recreate it on the new image (discarding in-container state).
+- **Toolchain changes.** The persistent container keeps running on the image it was created from. After changing the selection, `creel` warns and keeps the old container; run `creel --fresh` to recreate it on the new image (discarding in-container state). Tools you always want should therefore be baked in with `--provision` (see [Extra provisioning](#extra-provisioning)) rather than installed in-session, so recreation costs nothing.
 - **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, and the firewall on/off state are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
 
 The keep-alive container is just an idle `sleep`; stop it any time with `creel --stop` (the next run restarts it, state intact).
@@ -310,6 +324,7 @@ All customization is via environment variables, no editing required:
 | `CREEL_RUN_EXTRA` | (empty) | Extra `docker run` flags, split with shell quoting rules |
 | `CREEL_GPUS` | `all` | Value for `--gpus` when a GPU toolchain is selected; empty omits it |
 | `CREEL_FIREWALL_ALLOW` | (empty) | Extra domains to allow through the firewall, space-separated |
+| `CREEL_PROVISION` | (unset) | Default for `--provision` when the flag is absent |
 | `CREEL_DRY_RUN` | (unset) | If set, print the `docker build`/`docker run` commands and exit |
 | `ANTHROPIC_API_KEY` | (unset) | Forwarded into the container if present |
 | `CLAUDE_CODE_OAUTH_TOKEN` | (unset) | Forwarded into the container if present |
@@ -371,7 +386,7 @@ When you pull a newer `creel`, the next run refreshes each project's `.creel/Doc
 `creel` creates a `.creel/` directory containing:
 
 - `Dockerfile` — the generated build definition
-- `selection.json` — the saved toolchain set and session mode for this project
+- `selection.json` — the saved toolchain set, session mode, and provision command for this project
 - `.dockerfile.sha256` — the checksum sidecar for the edit guard
 
 Add `.creel/` to your project `.gitignore`, or commit `Dockerfile` and `selection.json` if you want to pin the environment for collaborators (in that case still ignore `.dockerfile.sha256`).
