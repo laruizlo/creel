@@ -90,6 +90,7 @@ Like the session mode, the command is saved in `.creel/selection.json` and recal
 |------|--------|
 | `--shell` | Open `bash` in the container instead of launching `claude` |
 | `--yolo` | Launch `claude` with `--dangerously-skip-permissions` |
+| `--concise` | Load the [concise-output](https://github.com/NTCoding/claude-skillz/blob/main/concise-output/SKILL.md) skill for the session (terse, high-signal replies) |
 | `--no-firewall` | Disable the default-deny egress firewall (on by default) |
 | `--stateless` | Use a throwaway container per session (saved per project) |
 | `--stateful` | Reuse a persistent per-project container (saved; the default) |
@@ -230,7 +231,7 @@ What does *not* persist or work:
 
 - **System packages.** The hardening (`--cap-drop=ALL`, `no-new-privileges`) blocks `sudo`, so `apt install` fails at run time by design. Toolchains belong in the image; select the flag and rebuild.
 - **Toolchain changes.** The persistent container keeps running on the image it was created from. After changing the selection, `creel` warns and keeps the old container; run `creel --fresh` to recreate it on the new image (discarding in-container state). Tools you always want should therefore be baked in with `--provision` (see [Extra provisioning](#extra-provisioning)) rather than installed in-session, so recreation costs nothing.
-- **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, and the firewall on/off state are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
+- **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, and the firewall on/off state are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, `--concise`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
 
 The keep-alive container is just an idle `sleep`; stop it any time with `creel --stop` (the next run restarts it, state intact).
 
