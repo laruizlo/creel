@@ -32,10 +32,16 @@ Two reasons you might want Claude Code in a container:
 ## Install
 
 ```sh
+./install.sh
+```
+
+The installer offers your existing install location and the writable directories on `$PATH` as destinations (or any path you type), and uses `sudo` only when the chosen directory needs it. Without a TTY it installs to the first candidate, so it also works in scripts. Installing by hand works just as well:
+
+```sh
 install -m755 creel ~/.local/bin/creel   # or anywhere on PATH
 ```
 
-That is the whole installation. The script has a `#!/usr/bin/env python3` shebang and no extension, so it behaves as a normal `creel` command.
+The script has a `#!/usr/bin/env python3` shebang and no extension, so it behaves as a normal `creel` command. When upgrading, remember that existing stateful containers keep the old run settings until `creel --fresh`.
 
 ---
 
