@@ -333,7 +333,7 @@ What to expect per host:
 - **macOS / Windows Docker Desktop**: does not work; Docker runs in a VM with no host audio socket to mount. Use the host OS dictation instead: the terminal is local, so dictated text reaches Claude Code in the container like any other typing.
 - **Headless hosts**: no audio server, same answer as above. When no socket is found, `creel` prints a note and starts the session without audio.
 
-Two requirements on the Claude Code side: voice needs a claude.ai account login (`/login` once inside the container, it persists in the auth volume; an `ANTHROPIC_API_KEY` alone does not qualify), and transcription streams over a WebSocket to Anthropic. If `/voice` fails with the firewall on, the endpoint it needs is not on the allowlist yet; find it and add it via `CREEL_FIREWALL_ALLOW`.
+Two requirements on the Claude Code side: voice needs a claude.ai account login (`/login` once inside the container, it persists in the auth volume; an `ANTHROPIC_API_KEY` alone does not qualify), and transcription streams over a WebSocket to `wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`. That host is already on the firewall allowlist, so `/voice` works with the firewall on.
 
 If auto-detection picks the wrong socket (or none), point `CREEL_MIC_SOCKET` at the right one.
 
