@@ -92,6 +92,7 @@ Like the session mode, the command is saved in `.creel/selection.json` and recal
 | `--yolo` | Launch `claude` with `--dangerously-skip-permissions` |
 | `--concise` | Load the [concise-output](https://github.com/NTCoding/claude-skillz/blob/main/concise-output/SKILL.md) skill for the session (terse, high-signal replies) |
 | `--no-firewall` | Disable the default-deny egress firewall (on by default) |
+| `--mic` | Forward the host PulseAudio/PipeWire socket so Claude Code's `/voice` dictation can record (saved per project; off by default, `--no-mic` turns it back off) |
 | `--stateless` | Use a throwaway container per session (saved per project) |
 | `--stateful` | Reuse a persistent per-project container (saved; the default) |
 | `--fresh` | Discard the persistent container and start over |
@@ -231,7 +232,7 @@ What does *not* persist or work:
 
 - **System packages.** The hardening (`--cap-drop=ALL`, `no-new-privileges`) blocks `sudo`, so `apt install` fails at run time by design. Toolchains belong in the image; select the flag and rebuild.
 - **Toolchain changes.** The persistent container keeps running on the image it was created from. After changing the selection, `creel` warns and keeps the old container; run `creel --fresh` to recreate it on the new image (discarding in-container state). Tools you always want should therefore be baked in with `--provision` (see [Extra provisioning](#extra-provisioning)) rather than installed in-session, so recreation costs nothing.
-- **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, and the firewall on/off state are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, `--concise`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
+- **Creation-time settings.** GPU flags, `CREEL_RUN_EXTRA`, the firewall on/off state, and the `--mic` audio mount are fixed when the container is created; `--fresh` applies changes. Per-session choices (`--shell`, `--yolo`, `--concise`, forwarded `claude` args, `ANTHROPIC_API_KEY`) stay flexible, since each session is its own `exec`.
 
 The keep-alive container is just an idle `sleep`; stop it any time with `creel --stop` (the next run restarts it, state intact).
 
@@ -247,6 +248,7 @@ The container is meant to be a boundary, especially in `--yolo` mode:
 - The project directory is bind-mounted read-write (intended: the agent edits your code). The rest of your host home is not visible.
 - Git identity is forwarded read-only (`~/.gitconfig`, not a secret). SSH keys and cloud credentials are deliberately **not** mounted. Pushing to a remote needs a scoped token you supply on purpose.
 - Anything reachable inside the container, including the credentials in the mounted `~/.claude`, is readable by the agent. Use this for trusted repositories.
+- The host microphone is not reachable unless you opt in with `--mic`, which forwards the host audio socket (see [Voice dictation](#voice-dictation)). The socket grants full audio-server access (recording included), so the flag is off by default and saved per project, never globally.
 
 By default outbound traffic is locked down to a default-deny egress firewall with an allowlist (Anthropic API, npm, GitHub, common package registries, plus anything you add). Pass `--no-firewall` to allow normal network egress instead. See [Firewall](#firewall) for what it does and its trade-offs.
 
@@ -313,6 +315,30 @@ If a session behaves as though the network is down, it usually means something i
 
 ---
 
+## Voice dictation
+
+Claude Code has a built-in [voice dictation](https://code.claude.com/docs/en/voice-dictation.md) mode (`/voice`): it records from a microphone and streams the audio to Anthropic's transcription service. Recording needs an audio device, which a container does not have by default. `--mic` closes that gap:
+
+```sh
+creel --mic          # saved in .creel/selection.json; later runs recall it
+creel --no-mic       # turn it back off
+```
+
+With the flag on, `creel` locates the host's PulseAudio/PipeWire socket (`$XDG_RUNTIME_DIR/pulse/native`, with a WSLg fallback), bind-mounts it into the container, and points `PULSE_SERVER` at it. The SoX recorder Claude Code uses on Linux is baked into every image, so like the firewall this is a pure run-time toggle: no rebuild, no added capabilities (the host-matched `dev` user passes the audio server's peer-credential check). In stateful mode the mount is a creation-time setting; `creel` warns when the saved value and the running container disagree, and `--fresh` applies the change.
+
+What to expect per host:
+
+- **Linux desktop** (PulseAudio, or PipeWire with its pulse-compat socket): works.
+- **WSL2 with WSLg**: works, via `/mnt/wslg/PulseServer`.
+- **macOS / Windows Docker Desktop**: does not work; Docker runs in a VM with no host audio socket to mount. Use the host OS dictation instead: the terminal is local, so dictated text reaches Claude Code in the container like any other typing.
+- **Headless hosts**: no audio server, same answer as above. When no socket is found, `creel` prints a note and starts the session without audio.
+
+Two requirements on the Claude Code side: voice needs a claude.ai account login (`/login` once inside the container, it persists in the auth volume; an `ANTHROPIC_API_KEY` alone does not qualify), and transcription streams over a WebSocket to Anthropic. If `/voice` fails with the firewall on, the endpoint it needs is not on the allowlist yet; find it and add it via `CREEL_FIREWALL_ALLOW`.
+
+If auto-detection picks the wrong socket (or none), point `CREEL_MIC_SOCKET` at the right one.
+
+---
+
 ## Customization
 
 All customization is via environment variables, no editing required:
@@ -325,6 +351,7 @@ All customization is via environment variables, no editing required:
 | `CREEL_RUN_EXTRA` | (empty) | Extra `docker run` flags, split with shell quoting rules |
 | `CREEL_GPUS` | `all` | Value for `--gpus` when a GPU toolchain is selected; empty omits it |
 | `CREEL_FIREWALL_ALLOW` | (empty) | Extra domains to allow through the firewall, space-separated |
+| `CREEL_MIC_SOCKET` | (auto-detected) | Host audio socket forwarded by `--mic`, when auto-detection misses |
 | `CREEL_PROVISION` | (unset) | Default for `--provision` when the flag is absent |
 | `CREEL_DRY_RUN` | (unset) | If set, print the `docker build`/`docker run` commands and exit |
 | `ANTHROPIC_API_KEY` | (unset) | Forwarded into the container if present |

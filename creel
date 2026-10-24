@@ -35,11 +35,15 @@ DRY_RUN = bool(os.environ.get("CREEL_DRY_RUN"))
 GPUS = os.environ.get("CREEL_GPUS", "all")             # --gpus value for CUDA
 FW_ALLOW = os.environ.get("CREEL_FIREWALL_ALLOW", "")  # extra allowed domains
 PROVISION_ENV = os.environ.get("CREEL_PROVISION")      # default for --provision
+MIC_SOCKET = os.environ.get("CREEL_MIC_SOCKET", "")    # host audio socket for --mic
+MIC_MOUNT = "/run/pulse/native"                        # where --mic mounts it
 
-# Base tooling, always present. Includes the firewall machinery so that
-# --firewall is a pure run-time toggle needing no rebuild.
+# Base tooling, always present. Includes the firewall machinery and the SoX
+# recorder (with its PulseAudio backend, claude's documented /voice fallback)
+# so that --firewall and --mic are pure run-time toggles needing no rebuild.
 BASE_APT = ["ca-certificates", "curl", "git", "less", "ripgrep", "sudo",
-            "iptables", "ipset", "dnsutils", "jq", "aggregate", "iproute2", "gosu"]
+            "iptables", "ipset", "dnsutils", "jq", "aggregate", "iproute2", "gosu",
+            "sox", "libsox-fmt-pulse"]
 
 LANG = "Languages / compilers"
 GPU = "GPU / accelerators"
@@ -541,6 +545,19 @@ def guard_write(box, content, regen):
               "(use --regen to overwrite).", file=sys.stderr)
 
 
+def find_pulse_socket():
+    """Host PulseAudio/PipeWire socket to forward for --mic, or None."""
+    uid = os.getuid() if hasattr(os, "getuid") else 1000
+    run_dir = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % uid
+    candidates = [MIC_SOCKET] if MIC_SOCKET else \
+                 [run_dir + "/pulse/native",   # PulseAudio, or pipewire-pulse compat
+                  "/mnt/wslg/PulseServer"]     # WSLg
+    for c in candidates:
+        if Path(c).is_socket():
+            return str(Path(c).resolve())  # docker -v needs an absolute source
+    return None
+
+
 # ---------------------------------------------------------------- CLI
 def build_parser():
     p = argparse.ArgumentParser(
@@ -550,7 +567,7 @@ def build_parser():
         epilog="Flags define the FULL toolchain set and are saved to "
                ".creel/selection.json.\nPassing any toolchain flag replaces "
                "the saved set; running with none recalls it.\nThe session mode "
-               "(--stateful/--stateless) and --provision are saved the same way.\n"
+               "(--stateful/--stateless), --provision, and --mic are saved the same way.\n"
                "Forward args to claude after `--`, e.g. `creel --rust -- --model opus`.",
     )
     groups = {}
@@ -572,6 +589,9 @@ def build_parser():
                           "(terse, high-signal replies)")
     opt.add_argument("--firewall", action=argparse.BooleanOptionalAction, default=True,
                      help="default-deny egress firewall inside the container (default: on)")
+    opt.add_argument("--mic", action=argparse.BooleanOptionalAction, default=None,
+                     help="forward the host PulseAudio/PipeWire socket so claude's "
+                          "/voice dictation can record (saved; default: off)")
     opt.add_argument("--stateful", action="store_true",
                      help="reuse a persistent per-project container so in-session "
                           "installs survive (saved; the default)")
@@ -678,7 +698,8 @@ def main(argv=None):
     provision = (args.provision if args.provision is not None else
                  PROVISION_ENV if PROVISION_ENV is not None else
                  saved.get("provision", ""))
-    state = {"toolchains": chosen, "mode": mode, "provision": provision}
+    mic = args.mic if args.mic is not None else saved.get("mic", False)
+    state = {"toolchains": chosen, "mode": mode, "provision": provision, "mic": mic}
     if state != saved:
         sel_file.write_text(json.dumps(state, indent=2) + "\n")
     selected = [BY_NAME[n] for n in chosen]
@@ -722,6 +743,20 @@ def main(argv=None):
     gitconfig = Path.home() / ".gitconfig"
     if args.git and gitconfig.is_file():
         common += ["-v", "%s:/home/dev/.gitconfig:ro" % gitconfig]
+
+    # --mic forwards the host audio socket; the UID-matched dev user passes the
+    # server's peer-credential check, so no capabilities are involved.
+    mic_sock = find_pulse_socket() if mic else None
+    if mic and not mic_sock:
+        print(">> note (mic): no host PulseAudio/PipeWire socket found; "
+              "/voice will not work (see README)", file=sys.stderr)
+    if mic_sock:
+        common += ["-v", "%s:%s" % (mic_sock, MIC_MOUNT),
+                   "-e", "PULSE_SERVER=unix:" + MIC_MOUNT]
+        cookie = Path.home() / ".config/pulse/cookie"
+        if cookie.is_file():
+            common += ["-v", "%s:/home/dev/.config/pulse/cookie:ro" % cookie]
+
     if RUN_EXTRA:
         common += shlex.split(RUN_EXTRA)
 
@@ -806,10 +841,13 @@ def main(argv=None):
 
     # ---------------- stateful session ----------------
     info = subprocess.run(["docker", "inspect", "-f",
-                           "{{.State.Running}} {{.Image}} {{.Path}}", ctr],
+                           "{{.State.Running}} {{.Image}} {{.Path}} "
+                           "{{range .Mounts}}{{.Destination}},{{end}}", ctr],
                           capture_output=True, text=True)
     if info.returncode == 0:
-        running, ctr_img, ctr_path = info.stdout.split()
+        fields = info.stdout.split()
+        running, ctr_img, ctr_path = fields[:3]
+        mounts = fields[3].split(",") if len(fields) > 3 else []
         img = subprocess.run(["docker", "image", "inspect", "-f", "{{.Id}}", image_tag],
                              capture_output=True, text=True).stdout.strip()
         if ctr_img != img:
@@ -820,6 +858,11 @@ def main(argv=None):
         if has_fw != args.firewall:
             print(">> warning: %s was created with the firewall %s; "
                   "`creel --fresh` applies the change" % (ctr, "on" if has_fw else "off"),
+                  file=sys.stderr)
+        has_mic = MIC_MOUNT in mounts
+        if has_mic != bool(mic_sock):
+            print(">> warning: %s was created with the mic %s; "
+                  "`creel --fresh` applies the change" % (ctr, "on" if has_mic else "off"),
                   file=sys.stderr)
         fw_wait = has_fw and running != "true"
         if running != "true":
